@@ -1,9 +1,13 @@
+import argparse
+import asyncio
+import logging
 import os
 import re
+import sys
 from pathlib import Path
 
 from openai import OpenAI
-from telegram import Update
+from telegram import Bot, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -12,53 +16,40 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
-# ============================================================
-# PATHS & CONFIGURATION
-# ============================================================
+# Concise standard logging setup
+logging.basicConfig(
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+logger = logging.getLogger("Coach")
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BASE_DIR = Path(__file__).parent
-
-SKILLS_PATH = BASE_DIR / "skills" / "interview-coach.md"
+SKILLS_PATH = BASE_DIR / "skills" / "telegram.md"
 STATE_PATH = BASE_DIR / "skills" / "state.md"
-
-client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1",
-)
 
 MODEL = "openai/gpt-oss-120b"
 
 
-# ============================================================
-# STATE & PROMPT HELPERS
-# ============================================================
-
 def read_file(path: Path) -> str:
-    if path.exists():
-        return path.read_text(encoding="utf-8")
-    return ""
+    return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
 def save_study_state(content: str):
+    logger.info("Saving updated study state to skills/state.md...")
     STATE_PATH.write_text(content, encoding="utf-8")
 
 
 def build_system_prompt() -> str:
     instructions = read_file(SKILLS_PATH)
     current_state = read_file(STATE_PATH)
-
-    return f"""
-{instructions}
-
-============================================================
-CURRENT CANDIDATE STUDY STATE (skills/state.md)
-============================================================
-{current_state}
-"""
+    return f"{instructions}\n\nCURRENT CANDIDATE STUDY STATE:\n{current_state}"
 
 
 def extract_and_save_state(ai_response: str) -> str:
@@ -68,33 +59,28 @@ def extract_and_save_state(ai_response: str) -> str:
     if match:
         updated_state = match.group(1).strip()
         save_study_state(updated_state)
-        cleaned_text = re.sub(pattern, "", ai_response, flags=re.DOTALL).strip()
-        return cleaned_text
+        return re.sub(pattern, "", ai_response, flags=re.DOTALL).strip()
 
+    logger.warning("No <STUDY_STATE> block found in response.")
     return ai_response
 
 
 def format_for_telegram(text: str) -> str:
-    """Sanitizes AI responses and converts Markdown/unsupported tags to Telegram HTML."""
     if not text:
         return ""
 
-    # Replace HTML line break tags with actual newline characters
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-
     lines = text.split("\n")
     cleaned_lines = []
 
     for line in lines:
         stripped = line.strip()
 
-        # Convert lingering ### Headers to <b>Bold Text</b>
         if stripped.startswith("#"):
             header_text = re.sub(r"^#+\s*", "", stripped)
             cleaned_lines.append(f"\n<b>{header_text}</b>")
             continue
 
-        # Convert lingering Markdown tables to bullet points
         if "|" in stripped:
             if re.match(r"^\|?[\s\:\-\|]+\|?$", stripped):
                 continue
@@ -108,151 +94,128 @@ def format_for_telegram(text: str) -> str:
         cleaned_lines.append(line)
 
     text = "\n".join(cleaned_lines)
-
-    # Convert standard Markdown syntax into Telegram-compatible HTML tags
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
     text = re.sub(r"`(.+?)`", r"<code>\1</code>", text)
-
-    # Clean up redundant line breaks
     text = re.sub(r"\n{3,}", "\n\n", text)
 
     return text.strip()
 
 
-# ============================================================
-# IN-MEMORY CHAT CONVERSATION
-# ============================================================
+async def send_daily_prompt():
+    logger.info("Triggering daily prompt workflow...")
+
+    if not TELEGRAM_TOKEN or not GROQ_API_KEY or not CHAT_ID:
+        logger.error("Missing required environment variables (TELEGRAM_BOT_TOKEN, GROQ_API_KEY, TELEGRAM_CHAT_ID).")
+        sys.exit(1)
+
+    client = OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url="https://api.groq.com/openai/v1",
+        timeout=30.0,
+    )
+
+    logger.info("Requesting interview question from Groq API...")
+    try:
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system", "content": build_system_prompt()},
+                {
+                    "role": "user",
+                    "content": "It is 8:00 AM. Send me today's technical interview question based on priority and review schedule in skills/state.md.",
+                },
+            ],
+            temperature=0.5,
+        )
+    except Exception as e:
+        logger.error(f"Groq API error: {e}")
+        sys.exit(1)
+
+    clean_message = extract_and_save_state(response.choices[0].message.content)
+    formatted_message = format_for_telegram(clean_message)
+
+    logger.info(f"Sending message to Telegram chat ID: {CHAT_ID}...")
+    try:
+        bot = Bot(token=TELEGRAM_TOKEN, request=HTTPXRequest(connect_timeout=30.0, read_timeout=30.0))
+        await bot.send_message(
+            chat_id=int(CHAT_ID),
+            text=f"☀️ <b>Daily Interview Prompt</b>\n\n{formatted_message}",
+            parse_mode=ParseMode.HTML,
+        )
+        logger.info("Done: Daily question sent successfully.")
+    except Exception as e:
+        logger.error(f"Telegram API error: {e}")
+        sys.exit(1)
+
 
 conversations = {}
 
 
-# ============================================================
-# TELEGRAM HANDLERS
-# ============================================================
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    logger.info(f"Session started for chat_id: {chat_id}")
 
-    system_prompt = build_system_prompt()
-    conversations[chat_id] = [{"role": "system", "content": system_prompt}]
+    client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=30.0)
+    conversations[chat_id] = [{"role": "system", "content": build_system_prompt()}]
+    conversations[chat_id].append(
+        {"role": "user", "content": "Start the interview now with highest priority question in skills/state.md."}
+    )
 
-    initial_prompt = "Start the interview now with the highest priority question based on skills/state.md."
-    conversations[chat_id].append({"role": "user", "content": initial_prompt})
+    response = client.chat.completions.create(model=MODEL, messages=conversations[chat_id], temperature=0.5)
+    conversations[chat_id].append({"role": "assistant", "content": response.choices[0].message.content})
 
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=conversations[chat_id],
-            temperature=0.5,
-        )
-        raw_response = response.choices[0].message.content
-        conversations[chat_id].append({"role": "assistant", "content": raw_response})
-
-        clean_message = extract_and_save_state(raw_response)
-        formatted_message = format_for_telegram(clean_message)
-
-        await update.message.reply_text(
-            f"👋 <b>Interview Session Started.</b>\n\n{formatted_message}",
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        print("Error during start:", e)
-        await update.message.reply_text("⚠️ Failed to start interview session. Check logs.")
+    clean_message = extract_and_save_state(response.choices[0].message.content)
+    await update.message.reply_text(format_for_telegram(clean_message), parse_mode=ParseMode.HTML)
 
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-
     if chat_id not in conversations:
-        await update.message.reply_text("No active session running.")
+        await update.message.reply_text("No active session.")
         return
 
-    wrap_up_prompt = (
-        "The user issued /done. Summarize the session performance, update "
-        "skills/state.md with all new findings, and wrap up."
-    )
-    conversations[chat_id].append({"role": "user", "content": wrap_up_prompt})
+    logger.info(f"Ending session for chat_id: {chat_id}")
+    client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=30.0)
+    conversations[chat_id].append({"role": "user", "content": "The user issued /done. Summarize and update skills/state.md."})
 
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=conversations[chat_id],
-            temperature=0.5,
-        )
-        raw_response = response.choices[0].message.content
+    response = client.chat.completions.create(model=MODEL, messages=conversations[chat_id], temperature=0.5)
+    clean_message = extract_and_save_state(response.choices[0].message.content)
 
-        clean_message = extract_and_save_state(raw_response)
-        formatted_message = format_for_telegram(clean_message)
-
-        await update.message.reply_text(
-            f"🏁 <b>Session Complete!</b>\n\n{formatted_message}",
-            parse_mode=ParseMode.HTML,
-        )
-
-        del conversations[chat_id]
-
-    except Exception as e:
-        print("Error during /done:", e)
-        await update.message.reply_text("⚠️ Could not process session completion.")
-
-
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    if chat_id in conversations:
-        del conversations[chat_id]
-    await update.message.reply_text("🔄 Local conversation memory reset.")
+    await update.message.reply_text(f"🏁 <b>Session Complete!</b>\n\n{format_for_telegram(clean_message)}", parse_mode=ParseMode.HTML)
+    del conversations[chat_id]
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_message = update.message.text
+    client = OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1", timeout=30.0)
 
     if chat_id not in conversations:
-        system_prompt = build_system_prompt()
-        conversations[chat_id] = [{"role": "system", "content": system_prompt}]
+        conversations[chat_id] = [{"role": "system", "content": build_system_prompt()}]
 
-    conversations[chat_id].append({"role": "user", "content": user_message})
-
-    # Refresh system prompt context with updated state before calling API
+    conversations[chat_id].append({"role": "user", "content": update.message.text})
     conversations[chat_id][0] = {"role": "system", "content": build_system_prompt()}
 
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=conversations[chat_id],
-            temperature=0.5,
-        )
-        raw_response = response.choices[0].message.content
-        conversations[chat_id].append({"role": "assistant", "content": raw_response})
+    response = client.chat.completions.create(model=MODEL, messages=conversations[chat_id], temperature=0.5)
+    conversations[chat_id].append({"role": "assistant", "content": response.choices[0].message.content})
 
-        clean_message = extract_and_save_state(raw_response)
-        formatted_message = format_for_telegram(clean_message)
+    clean_message = extract_and_save_state(response.choices[0].message.content)
+    await update.message.reply_text(format_for_telegram(clean_message), parse_mode=ParseMode.HTML)
 
-        await update.message.reply_text(
-            formatted_message,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        print("Error during chat execution:", e)
-        await update.message.reply_text("⚠️ An error occurred processing your response.")
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--send-daily", action="store_true", help="Send daily interview question and update state.")
+    args = parser.parse_args()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
-
-    print("🤖 Interview Coach running with openai/gpt-oss-120b and skills/state.md...")
-    app.run_polling()
+    if args.send_daily:
+        asyncio.run(send_daily_prompt())
+    else:
+        logger.info("Starting bot in polling mode...")
+        app = Application.builder().token(TELEGRAM_TOKEN).request(HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)).build()
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("done", done))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        app.run_polling()
 
 
 if __name__ == "__main__":
