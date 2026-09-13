@@ -1,0 +1,6 @@
+modal
+python-telegram-bot
+openai
+httpx
+python-dotenv
+fastapi
