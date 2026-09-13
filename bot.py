@@ -551,11 +551,22 @@ async def telegram_webhook(payload: dict, request: Request):
 def register_webhook():
     """Run once after `modal deploy` to point Telegram at the deployed
     webhook URL: `modal run bot.py::register_webhook`
+
+    IMPORTANT: this looks up the URL via modal.Function.from_name(), which
+    references the already-DEPLOYED function. It deliberately does NOT use
+    the local `telegram_webhook` object's .get_web_url() -- calling that
+    from within `modal run` spins up a separate, temporary ephemeral app
+    (URL ending in "-dev") that gets torn down the moment this command
+    exits, which would register a URL that stops working immediately after.
     """
-    url = telegram_webhook.get_web_url()
+    deployed_webhook = modal.Function.from_name("telegram-interview-coach", "telegram_webhook")
+    url = deployed_webhook.get_web_url()
     if not url:
         print("Could not resolve the webhook URL -- did you run `modal deploy bot.py` first?")
         return
+    if "-dev" in url:
+        print(f"WARNING: resolved URL looks like an ephemeral dev URL: {url}")
+        print("This should not happen when using Function.from_name() against a deployed app -- double check `modal deploy` succeeded.")
 
     secret = get_env_var("TELEGRAM_WEBHOOK_SECRET")
     if not secret:
@@ -576,6 +587,38 @@ def register_webhook():
         print(f"Pending update count: {info.pending_update_count}")
 
     asyncio.run(_register())
+
+
+@app.local_entrypoint()
+def check_webhook():
+    """Read-only diagnostic: shows Telegram's current view of the webhook
+    WITHOUT re-registering it. Crucially surfaces last_error_message, which
+    tells you exactly why Telegram couldn't deliver updates (e.g. a 401 from
+    a bad secret token, a 500 from an exception in your handler, a timeout,
+    etc). Run: `modal run bot.py::check_webhook`
+
+    Also prints the currently-DEPLOYED URL (via Function.from_name, not the
+    ephemeral one this `modal run` invocation would otherwise create) so you
+    can visually confirm it matches what Telegram has on file.
+    """
+    deployed_webhook = modal.Function.from_name("telegram-interview-coach", "telegram_webhook")
+    deployed_url = deployed_webhook.get_web_url()
+    print(f"Currently deployed URL: {deployed_url}")
+
+    from telegram import Bot
+
+    async def _check():
+        bot = Bot(token=require_env_var("TELEGRAM_BOT_TOKEN"))
+        info = await bot.get_webhook_info()
+        print(f"Telegram has registered: {info.url or '(none set)'}")
+        print(f"URLs match: {info.url == deployed_url}")
+        print(f"Pending update count: {info.pending_update_count}")
+        print(f"Last error date: {info.last_error_date}")
+        print(f"Last error message: {info.last_error_message}")
+        print(f"Max connections: {info.max_connections}")
+        print(f"Has custom certificate: {info.has_custom_certificate}")
+
+    asyncio.run(_check())
 
 # ============================================================
 # MODAL CLOUD CRON SCHEDULER & WORKER
