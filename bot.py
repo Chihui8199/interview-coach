@@ -77,6 +77,12 @@ app = modal.App(name="telegram-interview-coach", image=image)
 
 MODEL = "openai/gpt-oss-120b"
 
+# Cap on tokens the model is allowed to generate per reply. Response tokens
+# count against the same Groq TPM budget as the request, so this bounds
+# the "output" side of the 413 risk the same way MAX_HISTORY_MESSAGES
+# bounds the "input" side below.
+MAX_RESPONSE_TOKENS = 700
+
 # Dynamic Storage Path: Local folder on Mac vs Modal Volume in Cloud
 if modal.is_local():
     VOLUME_DIR = Path("./local_dev_state")
@@ -189,9 +195,51 @@ def _read_skill_file(path: Path, label: str) -> str:
         return ""
 
 
-def load_interview_skill() -> str:
-    """Reads skills/interview.md, the interview-coaching rules."""
-    return _read_skill_file(INTERVIEW_SKILL_PATH, "interview.md")
+# Markers wrapping the "TOPIC TAXONOMY (STRICT)" section in interview.md.
+# Splitting on these lets the taxonomy list (~470 tokens) be sent ONLY when
+# it's actually needed -- at /done, when the model has to pick a topic name
+# -- instead of on every single turn (/start, regular Q&A, the 8am
+# reminder), which was the direct cause of the 413 TPM error.
+TAXONOMY_MARKER_START = "<!-- TAXONOMY_START -->"
+TAXONOMY_MARKER_END = "<!-- TAXONOMY_END -->"
+
+
+def split_interview_skill(full_text: str) -> tuple[str, str]:
+    """Splits interview.md into (base_text, taxonomy_text).
+
+    base_text is everything OUTSIDE the TAXONOMY_START/END markers -- this
+    is what goes into build_system_prompt() and is sent on every turn.
+    taxonomy_text is everything BETWEEN the markers -- only appended in
+    build_done_prompt_addition(), sent only on /done.
+
+    Falls back to (full_text, "") if the markers aren't found (e.g.
+    interview.md hasn't been updated yet), so a missing marker never
+    crashes the bot -- worst case, the taxonomy just stays inline in every
+    turn like before.
+    """
+    start = full_text.find(TAXONOMY_MARKER_START)
+    end = full_text.find(TAXONOMY_MARKER_END)
+    if start == -1 or end == -1 or end < start:
+        logger.warning(
+            "Taxonomy markers not found in interview.md; taxonomy will "
+            "stay inline in every prompt instead of only on /done."
+        )
+        return full_text, ""
+    before = full_text[:start]
+    taxonomy = full_text[start + len(TAXONOMY_MARKER_START): end].strip()
+    after = full_text[end + len(TAXONOMY_MARKER_END):]
+    base = (before + after).strip()
+    return base, taxonomy
+
+
+def load_interview_skill() -> tuple[str, str]:
+    """Reads skills/interview.md and splits it into (base, taxonomy) via
+    split_interview_skill(). Returns ("", "") if the file is missing.
+    """
+    raw = _read_skill_file(INTERVIEW_SKILL_PATH, "interview.md")
+    if not raw:
+        return "", ""
+    return split_interview_skill(raw)
 
 
 def load_telegram_skill() -> str:
@@ -253,7 +301,10 @@ def init_db():
       to SQLite instead of an in-memory dict. The webhook is stateless
       (each request may land on a fresh container), so an in-memory dict
       would silently lose an in-progress conversation whenever Modal
-      recycles the container between messages. Keyed by chat_id.
+      recycles the container between messages. Keyed by chat_id. This
+      table always holds the FULL, untrimmed history -- see
+      cap_conversation_history() for the separate "what do we send to the
+      LLM this turn" decision.
     """
     VOLUME_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -489,10 +540,11 @@ def save_parsed_state(state_json_str: str):
 
 
 def load_conversation(chat_id: int):
-    """Loads a chat's in-progress message history from SQLite, or None if
-    there isn't one. Replaces the old in-memory `conversations` dict, which
-    would silently lose an in-progress interview whenever Modal recycled
-    the webhook's container between messages.
+    """Loads a chat's FULL, untrimmed in-progress message history from
+    SQLite, or None if there isn't one. Replaces the old in-memory
+    `conversations` dict, which would silently lose an in-progress
+    interview whenever Modal recycled the webhook's container between
+    messages.
     """
     if not DB_PATH.exists():
         init_db()
@@ -511,7 +563,12 @@ def load_conversation(chat_id: int):
 
 
 def save_conversation(chat_id: int, messages: list):
-    """Persists a chat's message history to SQLite after every turn."""
+    """Persists a chat's FULL message history to SQLite after every turn.
+    Callers must pass the untrimmed history here -- trimming for the LLM's
+    token budget happens separately via cap_conversation_history() and
+    must never be what gets written to disk, or trimmed-off turns are lost
+    for good.
+    """
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -545,15 +602,46 @@ def delete_conversation(chat_id: int):
         logger.error(f"Failed to delete conversation for chat {chat_id}: {e}")
 
 
-def safe_llm_call(client: OpenAI, messages: list, temperature: float = 0.5):
+# How many of the most recent non-system messages to actually send to the
+# LLM each turn. This is purely a "what do we resend to Groq" decision --
+# it never touches what's persisted to SQLite (see save_conversation),
+# so a long session no longer loses history once it gets trimmed, it just
+# stops re-paying the token cost of the full transcript on every turn.
+MAX_HISTORY_MESSAGES = 12
+
+
+def cap_conversation_history(messages: list, max_messages: int = MAX_HISTORY_MESSAGES) -> list:
+    """Returns a NEW list for sending to the LLM: the system prompt (always
+    kept, assumed to be messages[0]) plus only the most recent
+    `max_messages` user/assistant turns. Does not mutate `messages`, so the
+    caller's full history is unaffected and still gets saved in full.
+    """
+    if not messages:
+        return messages
+    system_msg = messages[0]
+    rest = messages[1:]
+    if len(rest) <= max_messages:
+        return list(messages)
+    trimmed = rest[-max_messages:]
+    return [system_msg] + trimmed
+
+
+def safe_llm_call(client: OpenAI, messages: list, temperature: float = 0.5, max_tokens: int = MAX_RESPONSE_TOKENS):
     """Calls the LLM and returns (content, error_message). On any failure
     (timeout, rate limit, API error, etc.) content is None and error_message
     describes what went wrong -- callers use this to send the user a clear
     "something went wrong" reply instead of the request silently failing
     with no response at all.
+
+    max_tokens bounds how much the model is allowed to generate -- response
+    tokens count against the same Groq TPM budget as the request, so this
+    caps the "output" side of the 413 risk (build_system_prompt's taxonomy
+    split and cap_conversation_history handle the "input" side).
     """
     try:
-        response = client.chat.completions.create(model=MODEL, messages=messages, temperature=temperature)
+        response = client.chat.completions.create(
+            model=MODEL, messages=messages, temperature=temperature, max_tokens=max_tokens
+        )
         return response.choices[0].message.content, None
     except Exception as e:
         logger.error(f"LLM call failed: {e}")
@@ -575,16 +663,17 @@ def extract_and_update_state(text: str) -> str:
 
 def build_system_prompt() -> str:
     """Base system prompt used for /start, regular messages, and the daily
-    8 AM reminder. Includes the interview coaching rules, Telegram
+    8 AM reminder. Includes the interview coaching rules (WITHOUT the
+    TOPIC TAXONOMY section -- see load_interview_skill), Telegram
     formatting rules, and the current SQLite study-state summary as
     read-only context -- but does NOT ask the AI to emit JSON. State is
     only written on /done (see build_done_prompt_addition).
     """
-    interview_context = load_interview_skill()
+    interview_base, _taxonomy = load_interview_skill()
     telegram_context = load_telegram_skill()
     db_context = get_db_summary()
 
-    interview_section = interview_context or "You are an elite technical interview coach."
+    interview_section = interview_base or "You are an elite technical interview coach."
     telegram_section = f"\n{telegram_context}\n" if telegram_context else ""
 
     return f"""{interview_section}
@@ -598,50 +687,73 @@ def build_done_prompt_addition() -> str:
     a session summary AND a <STUDY_STATE_JSON> block, which is parsed and
     saved to SQLite before the summary is sent back.
 
-    Topic naming is primarily constrained by the TOPIC TAXONOMY section in
-    skills/interview.md (already present in the system prompt) -- this
-    addition just reinforces that instruction right before the model emits
-    JSON. normalize_topic() in save_parsed_state() is the code-level backup
-    in case the model drifts anyway.
+    This is also the ONLY place the TOPIC TAXONOMY list gets sent to the
+    model -- it's pulled back in here (via load_interview_skill) rather
+    than living in build_system_prompt(), since /done is the only moment
+    the model actually has to pick a topic name. normalize_topic() in
+    save_parsed_state() remains the code-level backup in case the model
+    drifts from the list anyway.
     """
-    return """The user issued /done. Provide a concise summary of this session's
+    _base, taxonomy = load_interview_skill()
+    taxonomy_section = f"\n{taxonomy}\n" if taxonomy else ""
+
+    return f"""The user issued /done. Provide a concise summary of this session's
 progress, following the interview style and Telegram formatting rules above.
 Then, at the very end of your response, output JSON enclosed strictly in
 <STUDY_STATE_JSON> tags summarizing the status of each topic covered this
 session, so it can be saved to SQLite for next time.
 
-Use ONLY topic names from the TOPIC TAXONOMY list defined earlier in your
-instructions -- do not invent new phrasing for a topic that's already on
-that list. Only use a name outside the list if nothing on it is even
-approximately related to what was covered, and say so explicitly in your
-summary text.
-
+Use ONLY topic names from the TOPIC TAXONOMY list below -- do not invent
+new phrasing for a topic that's already on that list. Only use a name
+outside the list if nothing on it is even approximately related to what
+was covered, and say so explicitly in your summary text.
+{taxonomy_section}
 Example Tag Format:
 <STUDY_STATE_JSON>
 [
-  {"topic": "Kafka Rebalancing", "status": "needs_review", "notes": "Confused rebalancing with partition assignment", "priority": 3}
+  {{"topic": "Kafka Rebalancing", "status": "needs_review", "notes": "Confused rebalancing with partition assignment", "priority": 3}}
 ]
 </STUDY_STATE_JSON>
 """
 
 
-def format_for_telegram(text: str) -> str:
-    """Passes the AI's text through unchanged for Telegram's HTML parse mode.
+# telegram.md instructs the model to use only this small whitelist of real
+# HTML tags for formatting (see safe_reply below). LLM output isn't
+# guaranteed to stick to that whitelist, though -- it can emit stray angle
+# brackets (e.g. "if x < y compares...") or non-whitelisted tags (e.g.
+# <ul>, <div>) that Telegram's HTML parser rejects outright with a 400.
+ALLOWED_TELEGRAM_TAGS = {"b", "i", "code", "pre"}
+_TAG_PATTERN = re.compile(r"</?([a-zA-Z0-9]+)\b[^>]*>")
 
-    We intentionally do NOT escape <, >, & here. telegram.md instructs the
-    AI to use a small whitelist of real HTML tags (<b>, <i>, <code>, <pre>)
-    for formatting, and those need to reach Telegram unescaped so they
-    actually render as bold/italic/etc. instead of showing up as literal
-    text. The skill file is the guardrail on which tags get used, not this
-    function.
+
+def format_for_telegram(text: str) -> str:
+    """Sanitizes the AI's raw text for Telegram's HTML parse mode.
+
+    Any well-formed `<...>` construct that ISN'T one of ALLOWED_TELEGRAM_TAGS
+    (open or close) gets its angle brackets escaped to &lt;/&gt;, turning it
+    into harmless literal text instead of markup Telegram's parser can choke
+    on. Real <b>/<i>/<code>/<pre> tags pass through untouched and still
+    render normally.
+
+    This is a targeted fix, not a full HTML sanitizer: it only catches
+    complete `<tag ...>` / `</tag>` constructs. safe_reply()'s plain-text
+    fallback remains the last line of defense for anything this misses
+    (e.g. a genuinely unbalanced whitelisted tag).
     """
-    return text
+    def _escape_if_not_allowed(match: re.Match) -> str:
+        full_tag = match.group(0)
+        tag_name = match.group(1).lower()
+        if tag_name in ALLOWED_TELEGRAM_TAGS:
+            return full_tag
+        return full_tag.replace("<", "&lt;").replace(">", "&gt;")
+
+    return _TAG_PATTERN.sub(_escape_if_not_allowed, text)
 
 
 async def safe_reply(message, text: str, prefix: str = ""):
     """Sends a reply via Telegram's HTML parse mode; if the model emitted
-    malformed or non-whitelisted HTML (unbalanced tags, a tag outside
-    telegram.md's whitelist, etc.), Telegram rejects the parse and
+    malformed or non-whitelisted HTML that format_for_telegram() didn't
+    catch (unbalanced tags, etc.), Telegram rejects the parse and
     reply_text() raises. Without this wrapper that exception propagates
     out of the handler and the user gets silence -- no reply at all, and
     no visible error. Falling back to a plain-text send guarantees the
@@ -670,18 +782,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Session started for chat_id: {chat_id}")
 
     client = OpenAI(api_key=require_env_var("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1", timeout=30.0)
-    messages = [{"role": "system", "content": build_system_prompt()}]
-    messages.append(
+    full_history = [{"role": "system", "content": build_system_prompt()}]
+    full_history.append(
         {"role": "user", "content": "Start the interview now with highest priority question from SQLite state."}
     )
 
-    raw_content, error = safe_llm_call(client, messages)
+    raw_content, error = safe_llm_call(client, full_history)
     if error:
         await message.reply_text("Sorry, I hit an error reaching the model. Please try again in a moment.")
         return
 
-    messages.append({"role": "assistant", "content": raw_content})
-    save_conversation(chat_id, messages)
+    full_history.append({"role": "assistant", "content": raw_content})
+    save_conversation(chat_id, full_history)
 
     await safe_reply(message, raw_content)
 
@@ -692,15 +804,25 @@ async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.effective_chat.id
-    messages = load_conversation(chat_id)
-    if messages is None:
+    full_history = load_conversation(chat_id)
+    if full_history is None:
         await message.reply_text("No active session.")
         return
 
     client = OpenAI(api_key=require_env_var("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1", timeout=30.0)
-    messages.append({"role": "user", "content": build_done_prompt_addition()})
+    full_history.append({"role": "user", "content": build_done_prompt_addition()})
 
-    raw_content, error = safe_llm_call(client, messages)
+    # /done deletes the whole conversation right after replying regardless
+    # of outcome, so there's no "persisted" copy to protect here -- but a
+    # very long session can still trip the same TPM limit on this call, so
+    # cap what gets sent the same way handle_message does. The trade-off:
+    # on a very long session the summary is written from only the recent
+    # window, not the full transcript -- a summary-quality concern, not a
+    # data-loss one, since study_state/study_history in SQLite are written
+    # from whatever the model outputs regardless of how much context it saw.
+    messages_to_send = cap_conversation_history(full_history)
+
+    raw_content, error = safe_llm_call(client, messages_to_send)
     if error:
         await message.reply_text("Sorry, I hit an error reaching the model while wrapping up. Your progress up to now is still saved -- please try /done again in a moment.")
         return
@@ -737,23 +859,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     client = OpenAI(api_key=require_env_var("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1", timeout=30.0)
 
-    messages = load_conversation(chat_id)
-    if messages is None:
-        messages = [{"role": "system", "content": build_system_prompt()}]
+    full_history = load_conversation(chat_id)
+    if full_history is None:
+        full_history = [{"role": "system", "content": build_system_prompt()}]
     else:
         # Refresh the system prompt in place, so it always reflects the
         # latest SQLite study-state even mid-conversation.
-        messages[0] = {"role": "system", "content": build_system_prompt()}
+        full_history[0] = {"role": "system", "content": build_system_prompt()}
 
-    messages.append({"role": "user", "content": message.text})
+    full_history.append({"role": "user", "content": message.text})
 
-    raw_content, error = safe_llm_call(client, messages)
+    # Trim for the token budget WITHOUT touching full_history -- this is
+    # purely a "what do we resend to Groq this turn" decision. full_history
+    # (everything) is what gets saved to SQLite below, regardless of how
+    # much of it was actually sent to the model.
+    messages_to_send = cap_conversation_history(full_history)
+
+    raw_content, error = safe_llm_call(client, messages_to_send)
     if error:
         await message.reply_text("Sorry, I hit an error reaching the model. Please try again in a moment.")
         return
 
-    messages.append({"role": "assistant", "content": raw_content})
-    save_conversation(chat_id, messages)
+    full_history.append({"role": "assistant", "content": raw_content})
+    save_conversation(chat_id, full_history)
 
     await safe_reply(message, raw_content)
 

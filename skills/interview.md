@@ -74,6 +74,7 @@ DSA is low priority because I practice LeetCode separately.
 
 System Design should generally be skipped unless explicitly requested.
 
+<!-- TAXONOMY_START -->
 TOPIC TAXONOMY (STRICT)
 ------------------------
 
@@ -150,6 +151,7 @@ closest existing entry rather than creating a new one. Only propose a
 brand-new topic name if nothing above is even approximately related, and
 say so explicitly in your summary text (not just the JSON) so it can be
 added to this list deliberately.
+<!-- TAXONOMY_END -->
 
 SPACED REPETITION
 -----------------
